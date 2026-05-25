@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Автозапуск бота при загрузке macOS через launchd.
+
+  УСТАНОВКА (один раз):
+  1. Замените /Users/alexeysemernya/Desktop/bybit_arb_bot на реальный путь
+  2. Скопируйте файл:
+     cp com.bybit.arbbot.plist ~/Library/LaunchAgents/
+  3. Загрузите агент:
+     launchctl load ~/Library/LaunchAgents/com.bybit.arbbot.plist
+  4. Запустить вручную (без перезагрузки):
+     launchctl start com.bybit.arbbot
+
+  ОСТАНОВКА:
+     launchctl stop com.bybit.arbbot
+
+  УДАЛИТЬ АВТОЗАПУСК:
+     launchctl unload ~/Library/LaunchAgents/com.bybit.arbbot.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.bybit.arbbot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/alexeysemernya/Desktop/bybit_arb_bot/.venv/bin/python3</string>
+        <string>/Users/alexeysemernya/Desktop/bybit_arb_bot/main.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/alexeysemernya/Desktop/bybit_arb_bot</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/alexeysemernya/Desktop/bybit_arb_bot/bot.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/alexeysemernya/Desktop/bybit_arb_bot/bot_error.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

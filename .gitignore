@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+trades.db
+bot.log
+bot.pid
+dashboard.html
+*.db-journal
+.claude/
+.idea/
