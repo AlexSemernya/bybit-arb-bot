@@ -426,7 +426,8 @@ class FundingRateBot:
             spot_price = self.client.get_last_price(symbol, "spot") or price
             spot_oid   = self.client.buy_spot(symbol, position_usd)
             if spot_oid:
-                spot_qty_raw     = config.POSITION_USD / spot_price
+                # Используем position_usd (Kelly-размер), а не config.POSITION_USD (фиксированный)
+                spot_qty_raw     = position_usd / spot_price
                 pos.spot_qty         = self.client.round_qty(spot_qty_raw, symbol, "spot")
                 pos.entry_spot_price = spot_price
                 pos.spot_order_id    = spot_oid
@@ -528,7 +529,11 @@ class FundingRateBot:
                     f"[{symbol}] Спот баланс {spot_bal} < {pos.spot_qty} "
                     f"(возможно не исполнилось полностью)"
                 )
-                pos.spot_qty = spot_bal  # корректируем
+                # Корректируем только если баланс ненулевой.
+                # Если spot_bal=0 — скорее всего задержка UTA API (токены есть,
+                # но ещё не отражены в walletBalance). Не обнуляем pos.spot_qty!
+                if spot_bal > 0:
+                    pos.spot_qty = spot_bal
 
         return True
 

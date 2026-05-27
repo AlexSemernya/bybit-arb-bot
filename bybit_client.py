@@ -286,12 +286,22 @@ class BybitClient:
             return None
 
     def get_spot_coin_balance(self, coin: str) -> float:
-        """Возвращает доступный баланс монеты в спот-кошельке UTA."""
+        """
+        Возвращает баланс монеты в спот-кошельке UTA.
+        Использует walletBalance (не availableToWithdraw) — в UTA только что купленные
+        токены могут быть заблокированы как маржа и availableToWithdraw = 0,
+        хотя фактически токены есть и их можно продать.
+        """
         try:
             resp = self.session.get_wallet_balance(accountType="UNIFIED")
             for c in resp["result"]["list"][0]["coin"]:
                 if c["coin"] == coin:
-                    return float(c.get("availableToWithdraw", 0))
+                    # walletBalance — фактическое кол-во токенов в аккаунте
+                    # availableToWithdraw может быть 0 если токены используются как маржа
+                    wallet_bal = float(c.get("walletBalance", 0))
+                    avail_bal  = float(c.get("availableToWithdraw", 0))
+                    # Берём максимум: если walletBalance > 0, токены есть
+                    return max(wallet_bal, avail_bal)
             return 0.0
         except Exception as e:
             logger.error(f"get_spot_coin_balance({coin}): {e}")
