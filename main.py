@@ -169,8 +169,24 @@ class FundingRateBot:
     def _run_iteration(self, iteration: int):
         # 1. Баланс и просадка
         balance = self.client.get_wallet_balance("USDT") or 0.0
-        if balance:
-            self.risk.update_balance(balance)
+
+        # Добавляем оценочную стоимость открытых спот-позиций к USDT балансу.
+        # Без этого: при покупке спота USDT временно падает на position_usd (~$10),
+        # и бот видит ложную просадку — drawdown_halt срабатывает сразу после открытия.
+        # С поправкой: просадка отражает РЕАЛЬНЫЕ потери (движение цены + комиссии),
+        # а не временное перемещение USDT в спот-токены.
+        if config.HEDGE_WITH_SPOT and self.active_positions:
+            spot_value = sum(
+                pos.spot_qty * pos.entry_spot_price
+                for pos in self.active_positions.values()
+                if pos.spot_qty > 0 and pos.entry_spot_price > 0
+            )
+        else:
+            spot_value = 0.0
+
+        effective_balance = balance + spot_value
+        if effective_balance:
+            self.risk.update_balance(effective_balance)
 
         dd = self.risk.current_drawdown()
         if dd >= config.MAX_DRAWDOWN_PCT and not self.risk.state.is_trading_halted:
