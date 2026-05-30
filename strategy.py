@@ -176,6 +176,43 @@ class FundingRateArbStrategy:
 
         # Сортируем: сначала по ставке, затем по стабильности
         candidates.sort(key=lambda x: (x["rate"], x["stability"]), reverse=True)
+
+        # ── Фильтр категорий: защита от корреляции ───────────
+        # Не берём более MAX_POSITIONS_PER_CATEGORY позиций в одной категории
+        # (мемкоины коррелируют — при дампе падают все вместе)
+        categories = getattr(self.cfg, "SYMBOL_CATEGORIES", {})
+        max_per_cat = getattr(self.cfg, "MAX_POSITIONS_PER_CATEGORY", 999)
+
+        if categories and max_per_cat < 999:
+            # Считаем уже занятые слоты по категориям (активные позиции)
+            cat_counts: dict = {}
+            for active_sym in active_symbols:
+                for cat, syms in categories.items():
+                    if active_sym in syms:
+                        cat_counts[cat] = cat_counts.get(cat, 0) + 1
+                        break
+
+            # Жадный выбор кандидатов с учётом лимита по категории
+            selected = []
+            for cand in candidates:
+                if len(selected) >= max_slots:
+                    break
+                sym_cat = None
+                for cat, syms in categories.items():
+                    if cand["symbol"] in syms:
+                        sym_cat = cat
+                        break
+                if sym_cat and cat_counts.get(sym_cat, 0) >= max_per_cat:
+                    logger.debug(
+                        f"{cand['symbol']}: категория '{sym_cat}' заполнена "
+                        f"({cat_counts[sym_cat]}/{max_per_cat}) — пропуск"
+                    )
+                    continue
+                selected.append(cand)
+                if sym_cat:
+                    cat_counts[sym_cat] = cat_counts.get(sym_cat, 0) + 1
+            return selected
+
         return candidates[:max_slots]
 
     def _rate_is_stable(self, current_rate: float, history: list) -> bool:

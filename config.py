@@ -75,17 +75,45 @@ MAX_HOLD_HOURS       = 96       # принудительно закрыть че
 
 # --- Позиция ---
 POSITION_USD         = 25.0     # USD на каждую ногу (fallback если Kelly отключён)
-MAX_POSITIONS        = 2        # макс. одновременных позиций
+MAX_POSITIONS        = 5        # макс. одновременных позиций (было 2 → утилизация 6%→30%)
 
 # --- Kelly-критерий (динамический размер позиции) ---
 # Размер ноги = KELLY_FRACTION * баланс, ограничен [MIN, MAX]
-# Пример: баланс $500  → 500 * 0.015 = $7.5  → clamp → $10 (MIN)
-#          баланс $2000 → 2000 * 0.015 = $30  → используем $30
-#          баланс $20000 → 20000 * 0.015 = $300 → clamp → $150 (MAX)
+# Пример: баланс $500  → 500 * 0.03 = $15   → используем $15
+#          баланс $2000 → 2000 * 0.03 = $60  → используем $60
+#          баланс $10000 → 10000 * 0.03 = $300 → clamp → $300 (MAX)
 KELLY_ENABLED        = True
-KELLY_FRACTION       = 0.015    # 1.5% баланса на одну ногу (консервативно, half-Kelly)
+KELLY_FRACTION       = 0.03     # 3% баланса на одну ногу (было 1.5% — удваиваем размер позиции)
 POSITION_USD_MIN     = 10.0     # минимальный размер ноги, USD
-POSITION_USD_MAX     = 150.0    # максимальный размер ноги, USD
+POSITION_USD_MAX     = 300.0    # максимальный размер ноги, USD (было 150)
+
+# --- Диверсификация по категориям (защита от корреляции) ---
+# Мемкоины коррелируют друг с другом — при крипто-дампе падают все вместе.
+# Ограничиваем кол-во позиций в одной категории.
+MAX_POSITIONS_PER_CATEGORY = 2   # макс. позиций в одной категории одновременно
+
+SYMBOL_CATEGORIES = {
+    "meme": [
+        "DOGEUSDT", "1000SHIBUSDT", "1000PEPEUSDT", "WIFUSDT", "1000BONKUSDT",
+        "1000FLOKIUSDT", "POPCATUSDT", "PNUTUSDT", "FARTCOINUSDT", "TRUMPUSDT",
+    ],
+    "ai": [
+        "TAOUSDT", "RENDERUSDT", "VIRTUALUSDT", "ENAUSDT", "WLDUSDT",
+    ],
+    "defi": [
+        "LINKUSDT", "AAVEUSDT", "UNIUSDT", "INJUSDT", "PENDLEUSDT",
+        "LDOUSDT", "GMXUSDT", "JUPUSDT",
+    ],
+    "l1_l2": [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "SUIUSDT",
+        "ADAUSDT", "AVAXUSDT", "TONUSDT", "NEARUSDT", "ARBUSDT", "OPUSDT",
+        "APTUSDT", "ATOMUSDT", "DOTUSDT", "LTCUSDT", "SEIUSDT",
+    ],
+    "other": [
+        "EIGENUSDT", "TIAUSDT", "ARKMUSDT", "ORDIUSDT", "GALAUSDT",
+        "SANDUSDT", "IMXUSDT", "PYTHUSDT", "MOVEUSDT", "ONDOUSDT", "HYPEUSDT",
+    ],
+}
 
 # --- Режим хеджирования ---
 # True  → Лонг спот + Шорт перп (дельта-нейтральный, рекомендуется)
