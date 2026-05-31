@@ -121,10 +121,15 @@ class FundingRateArbStrategy:
             if price <= 0:
                 continue
 
-            # ── Фильтр 1: минимальная ставка ─────────────
-            # Только ПОЛОЖИТЕЛЬНЫЕ ставки — long_spot_short_perp получает фандинг
-            # при отрицательных ставках мы бы платили, а не получали
-            if rate < self.cfg.MIN_FUNDING_RATE:
+            # ── Фильтр 1: направление по ставке ──────────
+            neg_enabled  = getattr(self.cfg, "NEGATIVE_FUNDING_ENABLED", False)
+            min_neg_rate = getattr(self.cfg, "MIN_NEGATIVE_FUNDING_RATE", -0.00015)
+
+            if rate >= self.cfg.MIN_FUNDING_RATE:
+                direction = "long_spot_short_perp"      # шортисты платят лонгистам
+            elif neg_enabled and rate <= min_neg_rate:
+                direction = "long_perp_short_spot"      # лонгисты платят шортистам
+            else:
                 continue
 
             # ── Фильтр 2: стабильность ставки ────────────
@@ -164,6 +169,7 @@ class FundingRateArbStrategy:
             candidates.append({
                 "symbol":       sym,
                 "rate":         rate,
+                "direction":    direction,
                 "price":        price,
                 "next_ms":      next_ms,
                 "volume":       vol,
@@ -215,6 +221,70 @@ class FundingRateArbStrategy:
 
         return candidates[:max_slots]
 
+    # ──────────────────────────────────────────
+    #  Уровень 2: Basis Mean Reversion
+    # ──────────────────────────────────────────
+    def scan_basis_opportunities(
+        self,
+        funding_data:   dict,   # {symbol: {"rate", "price", "next_time_ms"}}
+        spot_prices:    dict,   # {symbol: spot_price}
+        active_symbols: set,
+        max_slots:      int,
+    ) -> list:
+        """
+        Находит аномальный базис (perp/spot - 1) для basis mean reversion.
+
+        Когда perp > spot на BASIS_ENTRY_PCT — открываем short_perp + long_spot.
+        Когда perp < spot на BASIS_ENTRY_PCT — открываем long_perp + short_spot.
+
+        Работает независимо от ставки фандинга — деплоит капитал
+        даже когда ставки низкие и funding arb не даёт сигналов.
+        """
+        if not getattr(self.cfg, "BASIS_ARB_ENABLED", False):
+            return []
+
+        entry_pct = getattr(self.cfg, "BASIS_ENTRY_PCT", 0.003)
+        min_vol   = getattr(self.cfg, "MIN_VOLUME_24H_USD", 3_000_000)
+        candidates = []
+
+        for sym, data in funding_data.items():
+            if sym in active_symbols:
+                continue
+
+            perp_price = data.get("price", 0.0)
+            spot_price = spot_prices.get(sym, 0.0)
+
+            if perp_price <= 0 or spot_price <= 0:
+                continue
+
+            basis = (perp_price / spot_price) - 1.0
+
+            if abs(basis) < entry_pct:
+                continue
+
+            # Направление: куда идёт схождение
+            if basis > 0:
+                # perp дороже спота → перп упадёт или спот вырастет
+                direction = "basis_short_perp"   # short perp + long spot
+            else:
+                # perp дешевле спота → перп вырастет или спот упадёт
+                direction = "basis_long_perp"    # long perp + short spot
+
+            candidates.append({
+                "symbol":    sym,
+                "rate":      data.get("rate", 0.0),
+                "direction": direction,
+                "price":     perp_price,
+                "next_ms":   data.get("next_time_ms", 0),
+                "basis":     basis,
+                "be_cycles": 0,
+                "stability": abs(basis),
+            })
+
+        # Сортируем по величине базиса (аномальнее = выгоднее)
+        candidates.sort(key=lambda x: abs(x["basis"]), reverse=True)
+        return candidates[:max_slots]
+
     def _rate_is_stable(self, current_rate: float, history: list) -> bool:
         """
         Проверяет стабильность ставки.
@@ -260,15 +330,46 @@ class FundingRateArbStrategy:
           5. Ставка изменила знак (после min_cycles)
           6. Ставка слишком низкая перед следующим фандингом
         """
+        is_basis = pos.direction.startswith("basis_")
+
+        # ── BASIS ARBTRAGE: отдельная логика выхода ───────────
+        if is_basis:
+            basis_exit  = getattr(self.cfg, "BASIS_EXIT_PCT", 0.0005)
+            basis_max_h = getattr(self.cfg, "BASIS_MAX_HOLD_HOURS", 24)
+
+            if current_spot_price > 0 and current_perp_price > 0:
+                current_basis = (current_perp_price / current_spot_price) - 1.0
+
+                if pos.direction == "basis_short_perp" and current_basis <= basis_exit:
+                    return True, "basis_converged"
+                if pos.direction == "basis_long_perp" and current_basis >= -basis_exit:
+                    return True, "basis_converged"
+
+                # Базис инвертировался против нас — выходим
+                if pos.direction == "basis_short_perp" and current_basis < -basis_exit * 3:
+                    return True, "basis_inverted"
+                if pos.direction == "basis_long_perp" and current_basis > basis_exit * 3:
+                    return True, "basis_inverted"
+
+            if pos.age_hours() >= basis_max_h:
+                return True, "basis_max_hold"
+
+            return False, "hold"
+
+        # ── FUNDING ARBITRAGE: стандартная логика выхода ──────
+
         # 1. Стоп-лосс (только при отсутствии спот-хеджа)
         if not getattr(self.cfg, "HEDGE_WITH_SPOT", True):
             if pos.entry_perp_price > 0:
                 price_chg = (current_perp_price - pos.entry_perp_price) / pos.entry_perp_price
-                if price_chg > self.cfg.STOP_LOSS_PCT:
+                # long_spot_short_perp: цена идёт вверх — перп теряет
+                if pos.direction == "long_spot_short_perp" and price_chg > self.cfg.STOP_LOSS_PCT:
+                    return True, "stop_loss"
+                # long_perp_short_spot: цена идёт вниз — перп теряет
+                if pos.direction == "long_perp_short_spot" and price_chg < -self.cfg.STOP_LOSS_PCT:
                     return True, "stop_loss"
 
         # 2. Базис-риск: если спред спот/перп > порога — ликвидность нарушена
-        # dynamic_max_basis_pct расширяет порог в периоды высокой волатильности (ATR)
         if dynamic_max_basis_pct is not None:
             max_basis = dynamic_max_basis_pct
         else:
@@ -279,7 +380,7 @@ class FundingRateArbStrategy:
             if basis > max_basis:
                 logger.warning(
                     f"[{pos.symbol}] Базис {basis*100:.2f}% > {max_basis*100:.2f}%"
-                    f"{'(ATR-динамический)' if dynamic_max_basis_pct is not None else ''} — выход"
+                    f"{'(ATR)' if dynamic_max_basis_pct is not None else ''} — выход"
                 )
                 return True, "basis_risk"
 
@@ -287,16 +388,21 @@ class FundingRateArbStrategy:
         if pos.age_hours() >= self.cfg.MAX_HOLD_HOURS:
             return True, "max_hold_time"
 
-        # 4. Ставка упала ниже порога (только после min hold cycles)
+        # 4 & 5. Ставка: выход после min hold cycles
         if pos.funding_cycles_held >= self.cfg.MIN_HOLD_CYCLES:
-            if abs(current_rate) < self.cfg.EXIT_FUNDING_RATE:
-                return True, "rate_dropped"
+            exit_neg = getattr(self.cfg, "EXIT_NEGATIVE_FUNDING_RATE", -0.00006)
 
-            # 5. Ставка изменила знак
-            if pos.entry_funding_rate > 0 and current_rate < -0.0001:
-                return True, "rate_flipped"
-            if pos.entry_funding_rate < 0 and current_rate > 0.0001:
-                return True, "rate_flipped"
+            if pos.direction == "long_spot_short_perp":
+                if current_rate < self.cfg.EXIT_FUNDING_RATE:
+                    return True, "rate_dropped"
+                if current_rate < -0.0001:
+                    return True, "rate_flipped"
+
+            elif pos.direction == "long_perp_short_spot":
+                if current_rate > exit_neg:     # ставка стала менее отрицательной
+                    return True, "rate_recovered"
+                if current_rate > 0.0001:       # ставка ушла в плюс
+                    return True, "rate_flipped"
 
         # 6. Ставка низкая перед следующим фандингом
         close_before = getattr(self.cfg, "CLOSE_BEFORE_FUNDING_MIN", 10)

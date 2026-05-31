@@ -218,7 +218,7 @@ class FundingRateBot:
         for sym in list(self.active_positions.keys()):
             self._check_position(sym, funding_data, balance)
 
-        # 6. Ищем новые входы
+        # 6. Ищем новые входы (funding arb + basis arb)
         free_slots = config.MAX_POSITIONS - len(self.active_positions)
         if free_slots > 0 and not self.risk.state.is_trading_halted:
             self._find_and_open_positions(funding_data, balance, free_slots)
@@ -361,6 +361,7 @@ class FundingRateBot:
     def _find_and_open_positions(self, funding_data: dict, balance: float, free_slots: int):
         active_syms = set(self.active_positions.keys())
 
+        # ── Поиск по ставке фандинга (Уровень 1) ─────────
         candidates = self.strategy.scan_opportunities(
             funding_data=funding_data,
             rate_history=self.rate_history_cache,
@@ -369,6 +370,21 @@ class FundingRateBot:
             max_slots=free_slots,
         )
 
+        # ── Поиск по базису (Уровень 2) ───────────────────
+        if len(candidates) < free_slots and getattr(config, "BASIS_ARB_ENABLED", False):
+            remaining = free_slots - len(candidates)
+            already_picked = active_syms | {c["symbol"] for c in candidates}
+            spot_prices = self.client.get_all_spot_prices(config.SYMBOLS)
+            basis_candidates = self.strategy.scan_basis_opportunities(
+                funding_data=funding_data,
+                spot_prices=spot_prices,
+                active_symbols=already_picked,
+                max_slots=remaining,
+            )
+            if basis_candidates:
+                logger.info(f"📐 Basis candidates: {[c['symbol'] for c in basis_candidates]}")
+            candidates += basis_candidates
+
         if not candidates:
             logger.debug("Нет кандидатов для входа (все фильтры прошли 0 символов)")
             return
@@ -376,23 +392,25 @@ class FundingRateBot:
         for cand in candidates:
             if len(self.active_positions) >= config.MAX_POSITIONS:
                 break
-            sym        = cand["symbol"]
-            rate       = cand["rate"]
-            price      = cand["price"]
-            be_cycles  = cand["be_cycles"]
+            sym       = cand["symbol"]
+            rate      = cand["rate"]
+            price     = cand["price"]
+            direction = cand.get("direction", "long_spot_short_perp")
+            be_cycles = cand["be_cycles"]
             logger.info(
-                f"✨ Кандидат: {sym} | rate={rate*100:.4f}% | "
+                f"✨ Кандидат: {sym} | {direction} | rate={rate*100:.4f}% | "
                 f"APY={annualized_rate(rate)*100:.1f}% | "
                 f"break-even={be_cycles:.1f}ц | "
                 f"vol=${self.volumes_24h_cache.get(sym,0)/1e6:.0f}M"
             )
-            self._open_position(sym, rate, price, balance, be_cycles)
+            self._open_position(sym, rate, price, balance, be_cycles, direction)
 
     # ──────────────────────────────────────────
     #  Открытие позиции
     # ──────────────────────────────────────────
     def _open_position(self, symbol: str, funding_rate: float,
-                       price: float, balance: float, be_cycles: float):
+                       price: float, balance: float, be_cycles: float,
+                       direction: str = "long_spot_short_perp"):
         # ── Kelly-критерий: динамический размер позиции ──
         position_usd = self.strategy.calc_position_usd(balance)
 
@@ -416,71 +434,86 @@ class FundingRateBot:
             return
 
         logger.info(
-            f"[{symbol}] 📥 Открываем | rate={funding_rate*100:.4f}% | "
-            f"APY={annualized_rate(funding_rate)*100:.1f}% | "
-            f"break-even={be_cycles:.1f}ц | qty={perp_qty} | "
-            f"leg=${position_usd:.1f} (Kelly={getattr(config,'KELLY_ENABLED',False)})"
+            f"[{symbol}] 📥 Открываем [{direction}] | rate={funding_rate*100:.4f}% | "
+            f"qty={perp_qty} | leg=${position_usd:.1f}"
         )
 
         pos = HedgedPosition(
             symbol=symbol,
-            direction="long_spot_short_perp",
+            direction=direction,
             entry_funding_rate=funding_rate,
             entry_perp_price=price,
             perp_qty=perp_qty,
             balance_before=balance,
         )
 
-        # Инициализируем tracking фандинга
         next_ms = self.last_funding_data.get(symbol, {}).get("next_time_ms", 0)
         pos.last_next_funding_ms = next_ms
 
         spot_ok = True
+        spot_price = self.client.get_last_price(symbol, "spot") or price
 
-        # ── Нога 1: Покупка спота ─────────────────────────
-        if config.HEDGE_WITH_SPOT:
-            spot_price = self.client.get_last_price(symbol, "spot") or price
-            spot_oid   = self.client.buy_spot(symbol, position_usd)
+        # ── Нога 1: Спот ─────────────────────────────────
+        if direction in ("long_spot_short_perp", "basis_short_perp"):
+            # Покупаем спот (Long Spot)
+            spot_oid = self.client.buy_spot(symbol, position_usd)
             if spot_oid:
-                # Используем position_usd (Kelly-размер), а не config.POSITION_USD (фиксированный)
-                spot_qty_raw     = position_usd / spot_price
+                spot_qty_raw         = position_usd / spot_price
                 pos.spot_qty         = self.client.round_qty(spot_qty_raw, symbol, "spot")
                 pos.entry_spot_price = spot_price
                 pos.spot_order_id    = spot_oid
-                # Базис при входе
                 if spot_price > 0:
                     pos.entry_basis_pct = abs(price / spot_price - 1.0)
-                logger.info(
-                    f"[{symbol}] Спот куплен: {pos.spot_qty} @ {spot_price:.4f} "
-                    f"(базис={pos.entry_basis_pct*100:.3f}%)"
-                )
+                logger.info(f"[{symbol}] Спот куплен: {pos.spot_qty} @ {spot_price:.4f}")
             else:
-                logger.error(f"[{symbol}] ❌ Ошибка спот-ордера — отменяем вход")
+                logger.error(f"[{symbol}] ❌ Ошибка покупки спота — отменяем вход")
                 spot_ok = False
+
+        elif direction in ("long_perp_short_spot", "basis_long_perp"):
+            # Шортим спот через маржу (Short Spot)
+            if config.HEDGE_WITH_SPOT:
+                spot_qty_raw = position_usd / spot_price
+                short_qty    = self.client.round_qty(spot_qty_raw, symbol, "spot")
+                spot_oid     = self.client.short_spot(symbol, short_qty)
+                if spot_oid:
+                    pos.spot_qty         = short_qty
+                    pos.entry_spot_price = spot_price
+                    pos.spot_order_id    = spot_oid
+                    logger.info(f"[{symbol}] Спот зашорчен: {short_qty} @ {spot_price:.4f}")
+                else:
+                    logger.error(f"[{symbol}] ❌ Ошибка шорта спота — отменяем вход")
+                    spot_ok = False
 
         if not spot_ok:
             return
 
-        # ── Нога 2: Шорт перпа ───────────────────────────
-        perp_oid = self.client.place_market_order(
-            symbol, "Sell", perp_qty, "linear", reduce_only=False
+        # ── Нога 2: Перп ─────────────────────────────────
+        perp_side = "Sell" if direction in ("long_spot_short_perp", "basis_short_perp") else "Buy"
+        perp_oid  = self.client.place_market_order(
+            symbol, perp_side, perp_qty, "linear", reduce_only=False
         )
         if not perp_oid:
             logger.error(f"[{symbol}] ❌ Ошибка перп-ордера — закрываем спот")
-            if config.HEDGE_WITH_SPOT and pos.spot_qty > 0:
-                self.client.sell_spot(symbol, pos.spot_qty)
+            if pos.spot_qty > 0:
+                if direction in ("long_spot_short_perp", "basis_short_perp"):
+                    self.client.sell_spot(symbol, pos.spot_qty)
+                else:
+                    self.client.cover_short_spot(symbol, pos.spot_qty * spot_price)
             return
 
         pos.perp_order_id = perp_oid
         time.sleep(1)
 
-        # ── Верификация позиций ───────────────────────────
+        # ── Верификация ───────────────────────────────────
         verified = self._verify_position(symbol, pos)
         if not verified:
             logger.error(f"[{symbol}] ❌ Верификация не прошла — экстренное закрытие")
             self.client.close_position(symbol, "linear")
-            if config.HEDGE_WITH_SPOT and pos.spot_qty > 0:
-                self.client.sell_spot(symbol, pos.spot_qty)
+            if pos.spot_qty > 0:
+                if direction in ("long_spot_short_perp", "basis_short_perp"):
+                    self.client.sell_spot(symbol, pos.spot_qty)
+                else:
+                    self.client.cover_short_spot(symbol, pos.spot_qty * spot_price)
             return
 
         # ── Позиция открыта ───────────────────────────────
@@ -488,7 +521,7 @@ class FundingRateBot:
         self.last_open_time     = datetime.now()
         self.inactivity_alerted = False
 
-        logger.info(f"[{symbol}] ✅ Позиция открыта и верифицирована")
+        logger.info(f"[{symbol}] ✅ Позиция открыта [{direction}]")
 
         self.tg.notify_position_opened(
             symbol=symbol,
@@ -574,16 +607,30 @@ class FundingRateBot:
 
         # ── Закрываем спот ────────────────────────────────
         exit_spot_price = 0.0
-        if config.HEDGE_WITH_SPOT and pos.spot_qty > 0:
-            coin     = symbol.replace("USDT", "")
-            spot_bal = self.client.get_spot_coin_balance(coin)
-            qty      = min(pos.spot_qty, spot_bal) if spot_bal > 0 else pos.spot_qty
-            if qty > 0:
-                sold = self.client.sell_spot(symbol, qty)
-                if sold:
+        is_long_spot = pos.direction in ("long_spot_short_perp", "basis_short_perp")
+        is_short_spot = pos.direction in ("long_perp_short_spot", "basis_long_perp")
+
+        if pos.spot_qty > 0:
+            if is_long_spot:
+                # Продаём купленный спот
+                coin     = symbol.replace("USDT", "")
+                spot_bal = self.client.get_spot_coin_balance(coin)
+                qty      = min(pos.spot_qty, spot_bal) if spot_bal > 0 else pos.spot_qty
+                if qty > 0:
+                    sold = self.client.sell_spot(symbol, qty)
+                    if sold:
+                        exit_spot_price = self.client.get_last_price(symbol, "spot") or 0.0
+                    else:
+                        logger.error(f"[{symbol}] Не удалось продать спот ({qty})")
+
+            elif is_short_spot:
+                # Покрываем маржинальный шорт спота
+                cover_usdt = pos.spot_qty * (self.client.get_last_price(symbol, "spot") or pos.entry_spot_price)
+                covered = self.client.cover_short_spot(symbol, cover_usdt * 1.01)  # +1% буфер на движение цены
+                if covered:
                     exit_spot_price = self.client.get_last_price(symbol, "spot") or 0.0
                 else:
-                    logger.error(f"[{symbol}] Не удалось продать спот ({qty})")
+                    logger.error(f"[{symbol}] Не удалось покрыть шорт спота")
 
         time.sleep(1)
         bal_after = self.client.get_wallet_balance("USDT") or bal_before

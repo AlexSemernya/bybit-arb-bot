@@ -285,6 +285,66 @@ class BybitClient:
             logger.error(f"sell_spot({symbol}, {base_qty}): {e}")
             return None
 
+    def short_spot(self, symbol: str, base_qty: float) -> Optional[str]:
+        """
+        Открыть маржинальный шорт спота (isLeverage=1).
+        Используется при стратегии long_perp_short_spot (отрицательный фандинг).
+        Bybit UTA автоматически занимает токены и продаёт их.
+        """
+        try:
+            qty = self.round_qty(base_qty, symbol, category="spot")
+            if qty <= 0:
+                logger.warning(f"short_spot({symbol}): qty={qty} <= 0, пропуск")
+                return None
+            resp = self.session.place_order(
+                category="spot",
+                symbol=symbol,
+                side="Sell",
+                orderType="Market",
+                qty=str(qty),
+                marketUnit="baseCoin",
+                isLeverage=1,
+            )
+            order_id = resp["result"]["orderId"]
+            logger.info(f"Ордер [spot SHORT]: {qty} {symbol} | id={order_id}")
+            return order_id
+        except Exception as e:
+            logger.error(f"short_spot({symbol}, {base_qty}): {e}")
+            return None
+
+    def cover_short_spot(self, symbol: str, usdt_amount: float) -> Optional[str]:
+        """
+        Закрыть маржинальный шорт спота (купить для покрытия долга).
+        Используется при закрытии long_perp_short_spot позиции.
+        """
+        try:
+            qty_str = f"{usdt_amount:.2f}"
+            resp = self.session.place_order(
+                category="spot",
+                symbol=symbol,
+                side="Buy",
+                orderType="Market",
+                qty=qty_str,
+                marketUnit="quoteCoin",
+            )
+            order_id = resp["result"]["orderId"]
+            logger.info(f"Ордер [spot COVER]: {qty_str} USDT → {symbol} | id={order_id}")
+            return order_id
+        except Exception as e:
+            logger.error(f"cover_short_spot({symbol}, {usdt_amount}): {e}")
+            return None
+
+    def get_all_spot_prices(self, symbols: list) -> dict:
+        """Возвращает {symbol: last_price} для всех символов за один запрос."""
+        try:
+            resp = self.session.get_tickers(category="spot")
+            price_map = {t["symbol"]: float(t.get("lastPrice", 0))
+                         for t in resp["result"]["list"]}
+            return {s: price_map.get(s, 0.0) for s in symbols}
+        except Exception as e:
+            logger.error(f"get_all_spot_prices: {e}")
+            return {s: 0.0 for s in symbols}
+
     def get_spot_coin_balance(self, coin: str) -> float:
         """
         Возвращает баланс монеты в спот-кошельке UTA.
