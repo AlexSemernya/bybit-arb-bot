@@ -76,6 +76,7 @@ class FundingRateBot:
 
     def __init__(self):
         self.running = True
+        self._shutdown_done = False   # защита от повторного shutdown (двойной SIGTERM)
 
         if not config.API_KEY or not config.API_SECRET:
             logger.error("API ключи не найдены! Заполните .env файл")
@@ -827,11 +828,18 @@ class FundingRateBot:
     #  Завершение
     # ──────────────────────────────────────────
     def _handle_shutdown(self, signum, frame):
+        # Деплой шлёт два сигнала (kill + pkill) → защита от повторного входа,
+        # иначе второй проход дёргает уже закрытую БД (Cannot operate on a closed database).
+        if self._shutdown_done:
+            return
         logger.info("\nОстановка бота...")
         self.running = False
         self._shutdown()
 
     def _shutdown(self):
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
         logger.info("Закрываем все позиции...")
         balance = self.client.get_wallet_balance("USDT") or 0.0
         for sym in list(self.active_positions.keys()):
