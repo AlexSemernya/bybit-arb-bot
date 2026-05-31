@@ -471,6 +471,13 @@ class FundingRateBot:
 
         elif direction in ("long_perp_short_spot", "basis_long_perp"):
             # Шортим спот через маржу (Short Spot)
+            # Требует ALLOW_SPOT_SHORT=True + настройки collateral в Bybit UTA
+            if not getattr(config, "ALLOW_SPOT_SHORT", False):
+                logger.warning(
+                    f"[{symbol}] {direction} требует ALLOW_SPOT_SHORT=True. "
+                    f"Включи collateral в Bybit UTA → установи ALLOW_SPOT_SHORT=True"
+                )
+                return
             if config.HEDGE_WITH_SPOT:
                 spot_qty_raw = position_usd / spot_price
                 short_qty    = self.client.round_qty(spot_qty_raw, symbol, "spot")

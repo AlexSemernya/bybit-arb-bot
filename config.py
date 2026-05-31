@@ -81,6 +81,11 @@ NEGATIVE_FUNDING_ENABLED  = True
 MIN_NEGATIVE_FUNDING_RATE = -0.00015  # войти когда rate ≤ -0.015%/8h
 EXIT_NEGATIVE_FUNDING_RATE = -0.00006  # выйти когда rate ≥ -0.006%/8h
 
+# Шорт спота требует включения collateral в Bybit UTA:
+# Assets → Unified Trading → Collateral Settings → включить нужные монеты
+# Пока не настроено — держать False (бот торгует только long-spot направления)
+ALLOW_SPOT_SHORT = False
+
 # --- Уровень 2: Basis Mean Reversion ---
 # Торгуем схождение спреда между перпом и спотом независимо от ставки фандинга.
 # Когда perp > spot на X% → это аномалия, обычно схлопывается за часы.
