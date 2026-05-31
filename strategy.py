@@ -53,6 +53,7 @@ class HedgedPosition:
     funding_cycles_held:    int   = 0
     estimated_funding:      float = 0.0
     last_next_funding_ms:   int   = 0   # последнее известное время следующего фандинга
+    funding_interval_h:     float = 8.0 # интервал фандинга монеты (часы) — 8/4/1
 
     # Мониторинг базиса (спред между спот и перп ценами)
     entry_basis_pct:     float = 0.0    # базис при входе (perp_price/spot_price - 1)
@@ -67,12 +68,15 @@ class HedgedPosition:
     def check_new_funding_cycle(self, new_next_funding_ms: int) -> bool:
         """
         Возвращает True если прошёл новый цикл фандинга.
-        Определяется по увеличению nextFundingTime на ~8 часов.
+        Определяется по увеличению nextFundingTime на ~интервал монеты.
+        Порог = половина интервала, чтобы корректно ловить и 1ч/4ч-монеты
+        (хардкод 8ч раньше вообще не считал циклы для частого фандинга).
         """
+        interval_ms = int(self.funding_interval_h * 3600 * 1000) or FUNDING_INTERVAL_MS
         if self.last_next_funding_ms == 0:
             self.last_next_funding_ms = new_next_funding_ms
             return False
-        if new_next_funding_ms > self.last_next_funding_ms + FUNDING_INTERVAL_MS // 2:
+        if new_next_funding_ms > self.last_next_funding_ms + interval_ms // 2:
             self.last_next_funding_ms = new_next_funding_ms
             return True
         return False
@@ -97,6 +101,7 @@ class FundingRateArbStrategy:
         volumes_24h:     dict,    # {symbol: float (USD)}
         active_symbols:  set,
         max_slots:       int,
+        funding_intervals: dict = None,   # {symbol: interval_hours}; None → всё 8ч
     ) -> list:
         """
         Находит символы подходящие для входа.
@@ -105,9 +110,13 @@ class FundingRateArbStrategy:
           2. Ставка стабильна (N последних периодов тоже положительны)
           3. 24h объём > MIN_VOLUME_24H
           4. Есть время до следующего фандинга (не входим прямо перед)
-          5. Ожидаемая прибыль покрывает комиссии (break-even)
+          5. Ожидаемая прибыль покрывает комиссии (break-even во ВРЕМЕНИ)
           6. Не занят в активной позиции
+
+        Ранжирование — по годовой доходности (APY), а НЕ по сырой ставке за период:
+        монета с фандингом каждый час при той же ставке приносит в 8× больше, чем 8ч.
         """
+        intervals  = funding_intervals or {}
         candidates = []
 
         for sym, data in funding_data.items():
@@ -122,12 +131,16 @@ class FundingRateArbStrategy:
                 continue
 
             # ── Фильтр 1: направление по ставке ──────────
+            # Порог калиброван под 8ч-фандинг → нормализуем ставку к 8ч-эквиваленту,
+            # иначе 1ч-монета с APY 88% отсеивается, а 8ч с APY 16% проходит.
             neg_enabled  = getattr(self.cfg, "NEGATIVE_FUNDING_ENABLED", False)
             min_neg_rate = getattr(self.cfg, "MIN_NEGATIVE_FUNDING_RATE", -0.00015)
+            interval_h   = intervals.get(sym, 8.0)
+            rate_8h      = rate * (8.0 / interval_h)
 
-            if rate >= self.cfg.MIN_FUNDING_RATE:
+            if rate_8h >= self.cfg.MIN_FUNDING_RATE:
                 direction = "long_spot_short_perp"      # шортисты платят лонгистам
-            elif neg_enabled and rate <= min_neg_rate:
+            elif neg_enabled and rate_8h <= min_neg_rate:
                 direction = "long_perp_short_spot"      # лонгисты платят шортистам
             else:
                 continue
@@ -155,16 +168,24 @@ class FundingRateArbStrategy:
                 )
                 continue
 
-            # ── Фильтр 5: окупаемость ─────────────────────
-            be_cycles = estimate_break_even_cycles(
+            # ── Фильтр 5: окупаемость (во ВРЕМЕНИ, а не в циклах) ──
+            be_cycles  = estimate_break_even_cycles(
                 self.cfg.POSITION_USD, abs(rate), self.cfg.BYBIT_TAKER_FEE
             )
-            max_affordable_be = getattr(self.cfg, "MAX_BREAK_EVEN_CYCLES", 8)
-            if be_cycles > max_affordable_be:
+            be_hours = be_cycles * interval_h
+            max_be_hours = getattr(
+                self.cfg, "MAX_BREAK_EVEN_HOURS",
+                getattr(self.cfg, "MAX_BREAK_EVEN_CYCLES", 18) * 8.0,
+            )
+            if be_hours > max_be_hours:
                 logger.debug(
-                    f"{sym}: break-even {be_cycles:.1f} циклов > {max_affordable_be} — пропуск"
+                    f"{sym}: break-even {be_hours:.0f}ч (={be_cycles:.1f}ц × {interval_h:.0f}ч) "
+                    f"> {max_be_hours:.0f}ч — пропуск"
                 )
                 continue
+
+            # Годовая доходность с учётом частоты фандинга (8760ч/год)
+            apy = abs(rate) * (8760.0 / interval_h)
 
             candidates.append({
                 "symbol":       sym,
@@ -174,14 +195,16 @@ class FundingRateArbStrategy:
                 "next_ms":      next_ms,
                 "volume":       vol,
                 "be_cycles":    be_cycles,
+                "interval_h":   interval_h,
+                "apy":          apy,
                 "stability":    self._rate_stability_score(history),
             })
 
         if not candidates:
             return []
 
-        # Сортируем: сначала по ставке, затем по стабильности
-        candidates.sort(key=lambda x: (x["rate"], x["stability"]), reverse=True)
+        # Сортируем по APY (частота фандинга учтена), затем по стабильности
+        candidates.sort(key=lambda x: (x["apy"], abs(x["stability"])), reverse=True)
 
         # ── Фильтр категорий: защита от корреляции ───────────
         # Не берём более MAX_POSITIONS_PER_CATEGORY позиций в одной категории
@@ -392,17 +415,25 @@ class FundingRateArbStrategy:
         if pos.funding_cycles_held >= self.cfg.MIN_HOLD_CYCLES:
             exit_neg = getattr(self.cfg, "EXIT_NEGATIVE_FUNDING_RATE", -0.00006)
 
+            # Защита от фиксации убытка: пока накопленный фандинг не покрыл
+            # round-trip комиссии (4 ноги × notional × taker), «затухание» ставки
+            # НЕ повод выходить — иначе ловим 2 цикла и закрываемся в минус.
+            # Адверсный флип знака режется всегда (держать = активно терять).
+            fee_rt    = 4 * pos.notional_usd() * getattr(self.cfg, "BYBIT_TAKER_FEE", 0.00055)
+            covered   = pos.estimated_funding >= fee_rt
+            allow_dec = covered or not getattr(self.cfg, "EXIT_ONLY_AFTER_BREAKEVEN", True)
+
             if pos.direction == "long_spot_short_perp":
-                if current_rate < self.cfg.EXIT_FUNDING_RATE:
-                    return True, "rate_dropped"
                 if current_rate < -0.0001:
                     return True, "rate_flipped"
+                if current_rate < self.cfg.EXIT_FUNDING_RATE and allow_dec:
+                    return True, "rate_dropped"
 
             elif pos.direction == "long_perp_short_spot":
-                if current_rate > exit_neg:     # ставка стала менее отрицательной
-                    return True, "rate_recovered"
                 if current_rate > 0.0001:       # ставка ушла в плюс
                     return True, "rate_flipped"
+                if current_rate > exit_neg and allow_dec:   # ставка стала менее отрицательной
+                    return True, "rate_recovered"
 
         # 6. Ставка низкая перед следующим фандингом
         close_before = getattr(self.cfg, "CLOSE_BEFORE_FUNDING_MIN", 10)

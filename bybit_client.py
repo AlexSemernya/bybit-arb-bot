@@ -334,6 +334,53 @@ class BybitClient:
             logger.error(f"cover_short_spot({symbol}, {usdt_amount}): {e}")
             return None
 
+    def get_all_funding_intervals(self, symbols: list) -> dict:
+        """
+        {symbol: interval_hours} одним запросом по всем linear-перпам.
+        Bybit отдаёт fundingInterval в минутах (480=8ч, 240=4ч, 60=1ч).
+        Критично для ранжирования: 0.01%/1ч ≈ 88% APY, а 0.02%/8ч ≈ 22% APY —
+        при сортировке по сырой ставке бот выбрал бы худшую монету.
+        Интервалы не меняются → кэшировать на стороне вызова.
+        """
+        try:
+            resp = self.session.get_instruments_info(category="linear")
+            out = {}
+            for it in resp["result"]["list"]:
+                try:
+                    out[it["symbol"]] = float(it.get("fundingInterval", 480)) / 60.0
+                except (TypeError, ValueError):
+                    out[it["symbol"]] = 8.0
+            return {s: out.get(s, 8.0) for s in symbols}
+        except Exception as e:
+            logger.error(f"get_all_funding_intervals: {e}")
+            return {s: 8.0 for s in symbols}
+
+    def get_collateral_info(self, coin: str) -> Optional[dict]:
+        """
+        Collateral-настройки монеты в UTA. Нужно для шорта спота
+        (long_perp_short_spot / basis_long_perp) — Bybit занимает токен,
+        чтобы его продать, и берёт почасовой процент за заём.
+
+        Возвращает:
+          {"enabled": bool,            # включена как collateral (collateralSwitch=ON)
+           "borrowable": bool,         # вообще можно занять
+           "hourly_borrow_rate": float}  # ставка займа за 1 час (доля, не %)
+        Или None при ошибке API.
+        """
+        try:
+            resp = self.session.get_collateral_info(currency=coin)
+            for c in resp["result"]["list"]:
+                if c["currency"] == coin:
+                    return {
+                        "enabled":    c.get("collateralSwitch") == "ON",
+                        "borrowable": bool(c.get("borrowable", False)),
+                        "hourly_borrow_rate": float(c.get("hourlyBorrowRate") or 0.0),
+                    }
+            return None
+        except Exception as e:
+            logger.error(f"get_collateral_info({coin}): {e}")
+            return None
+
     def get_all_spot_prices(self, symbols: list) -> dict:
         """Возвращает {symbol: last_price} для всех символов за один запрос."""
         try:
@@ -379,6 +426,20 @@ class BybitClient:
             return 0.0
         except Exception as e:
             logger.error(f"get_wallet_balance: {e}")
+            return None
+
+    def get_total_equity(self) -> Optional[float]:
+        """
+        Полная mark-to-market стоимость UTA-аккаунта (USDT + все монеты + unreal PnL).
+        Правильная база для просадки: незахеджированный спот, спот-холдинги и PnL
+        перпов учтены автоматически → ложная просадка от «крипты на споте» исключена.
+        """
+        try:
+            resp = self.session.get_wallet_balance(accountType="UNIFIED")
+            te = resp["result"]["list"][0].get("totalEquity")
+            return float(te) if te not in (None, "") else None
+        except Exception as e:
+            logger.error(f"get_total_equity: {e}")
             return None
 
     def get_volumes_24h(self, symbols: list, category: str = "linear") -> dict:

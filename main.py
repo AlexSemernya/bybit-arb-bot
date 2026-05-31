@@ -100,6 +100,9 @@ class FundingRateBot:
         # Кэш 24h объёмов {symbol: float}
         self.volumes_24h_cache: dict = {}
 
+        # Кэш интервалов фандинга {symbol: hours} — грузится один раз (не меняется)
+        self.funding_intervals_cache: dict = {}
+
         # Кэш ATR {symbol: float (абс. USD)} + время последнего обновления
         self.atr_cache:         dict = {}
         self._atr_last_refresh: float = 0.0
@@ -175,16 +178,22 @@ class FundingRateBot:
         # и бот видит ложную просадку — drawdown_halt срабатывает сразу после открытия.
         # С поправкой: просадка отражает РЕАЛЬНЫЕ потери (движение цены + комиссии),
         # а не временное перемещение USDT в спот-токены.
-        if config.HEDGE_WITH_SPOT and self.active_positions:
-            spot_value = sum(
-                pos.spot_qty * pos.entry_spot_price
-                for pos in self.active_positions.values()
-                if pos.spot_qty > 0 and pos.entry_spot_price > 0
-            )
-        else:
-            spot_value = 0.0
+        # Просадка считается от ПОЛНОЙ стоимости аккаунта (totalEquity): USDT + все
+        # монеты + unreal PnL перпов. Это исключает ложную просадку, когда USDT ушёл
+        # в спот (открытая позиция ИЛИ незакрытая «крипта на споте» после сбоя).
+        effective_balance = self.client.get_total_equity()
+        if effective_balance is None:
+            # Фоллбэк: USDT + оценка спота по отслеживаемым позициям
+            if config.HEDGE_WITH_SPOT and self.active_positions:
+                spot_value = sum(
+                    pos.spot_qty * pos.entry_spot_price
+                    for pos in self.active_positions.values()
+                    if pos.spot_qty > 0 and pos.entry_spot_price > 0
+                )
+            else:
+                spot_value = 0.0
+            effective_balance = balance + spot_value
 
-        effective_balance = balance + spot_value
         if effective_balance:
             self.risk.update_balance(effective_balance)
 
@@ -192,6 +201,8 @@ class FundingRateBot:
         if dd >= config.MAX_DRAWDOWN_PCT and not self.risk.state.is_trading_halted:
             self.tg.notify_drawdown_halt(dd * 100, balance)
             logger.critical(f"Просадка {dd*100:.1f}% — экстренное закрытие всего")
+            self.risk.state.is_trading_halted = True   # БАГ-ФИX: без этого halt срабатывал каждые 30с
+            self.risk.state.halt_reason = f"Просадка {dd*100:.1f}%"
             for sym in list(self.active_positions.keys()):
                 self._close_position(sym, "drawdown_halt", balance)
             return
@@ -361,6 +372,12 @@ class FundingRateBot:
     def _find_and_open_positions(self, funding_data: dict, balance: float, free_slots: int):
         active_syms = set(self.active_positions.keys())
 
+        # Интервалы фандинга грузим один раз (не меняются) — нужны для ранжирования по APY
+        if not self.funding_intervals_cache:
+            self.funding_intervals_cache = self.client.get_all_funding_intervals(config.SYMBOLS)
+            n_fast = sum(1 for h in self.funding_intervals_cache.values() if h < 8)
+            logger.info(f"Интервалы фандинга загружены | {n_fast} монет с интервалом < 8ч")
+
         # ── Поиск по ставке фандинга (Уровень 1) ─────────
         candidates = self.strategy.scan_opportunities(
             funding_data=funding_data,
@@ -368,6 +385,7 @@ class FundingRateBot:
             volumes_24h=self.volumes_24h_cache,
             active_symbols=active_syms,
             max_slots=free_slots,
+            funding_intervals=self.funding_intervals_cache,
         )
 
         # ── Поиск по базису (Уровень 2) ───────────────────
@@ -396,11 +414,13 @@ class FundingRateBot:
             rate      = cand["rate"]
             price     = cand["price"]
             direction = cand.get("direction", "long_spot_short_perp")
-            be_cycles = cand["be_cycles"]
+            be_cycles  = cand["be_cycles"]
+            interval_h = cand.get("interval_h", 8.0)
+            apy        = cand.get("apy", annualized_rate(rate))
             logger.info(
-                f"✨ Кандидат: {sym} | {direction} | rate={rate*100:.4f}% | "
-                f"APY={annualized_rate(rate)*100:.1f}% | "
-                f"break-even={be_cycles:.1f}ц | "
+                f"✨ Кандидат: {sym} | {direction} | rate={rate*100:.4f}%/{interval_h:.0f}ч | "
+                f"APY={apy*100:.1f}% | "
+                f"break-even={be_cycles*interval_h:.0f}ч | "
                 f"vol=${self.volumes_24h_cache.get(sym,0)/1e6:.0f}M"
             )
             self._open_position(sym, rate, price, balance, be_cycles, direction)
@@ -420,6 +440,35 @@ class FundingRateBot:
         if not can:
             logger.warning(f"[{symbol}] Заблокировано: {reason}")
             return
+
+        # ── Guard для шорт-спот направлений ──────────────
+        # long_perp_short_spot / basis_long_perp занимают базовый токен и
+        # платят за это почасовой borrow. Проверяем ДО входа, что:
+        #   1) монета включена как collateral в UTA (иначе ErrCode 170037),
+        #   2) borrow за цикл фандинга не съедает сам фандинг.
+        if direction in ("long_perp_short_spot", "basis_long_perp"):
+            coin = symbol.replace("USDT", "")
+            col  = self.client.get_collateral_info(coin)
+            if col is None or not col["enabled"] or not col["borrowable"]:
+                logger.warning(
+                    f"[{symbol}] {coin} не включена как collateral в Bybit UTA — "
+                    f"шорт спота невозможен (Assets → Collateral Settings). Пропуск."
+                )
+                return
+            # borrow за один цикл фандинга (8ч) vs полученный фандинг.
+            # Для basis_long_perp фандинга нет — сравниваем borrow с ожидаемым
+            # схождением базиса (порог входа BASIS_ENTRY_PCT).
+            borrow_cycle = col["hourly_borrow_rate"] * 8.0
+            if direction == "long_perp_short_spot":
+                edge = abs(funding_rate)
+            else:
+                edge = config.BASIS_ENTRY_PCT
+            if borrow_cycle >= edge:
+                logger.warning(
+                    f"[{symbol}] borrow {borrow_cycle*100:.4f}%/8ч ≥ edge "
+                    f"{edge*100:.4f}% — шорт спота нерентабелен. Пропуск."
+                )
+                return
 
         # Расчёт размера перп-ноги
         perp_qty_raw = self.strategy.calc_perp_qty(price, position_usd=position_usd)
@@ -445,6 +494,7 @@ class FundingRateBot:
             entry_perp_price=price,
             perp_qty=perp_qty,
             balance_before=balance,
+            funding_interval_h=self.funding_intervals_cache.get(symbol, 8.0),
         )
 
         next_ms = self.last_funding_data.get(symbol, {}).get("next_time_ms", 0)
@@ -500,12 +550,8 @@ class FundingRateBot:
             symbol, perp_side, perp_qty, "linear", reduce_only=False
         )
         if not perp_oid:
-            logger.error(f"[{symbol}] ❌ Ошибка перп-ордера — закрываем спот")
-            if pos.spot_qty > 0:
-                if direction in ("long_spot_short_perp", "basis_short_perp"):
-                    self.client.sell_spot(symbol, pos.spot_qty)
-                else:
-                    self.client.cover_short_spot(symbol, pos.spot_qty * spot_price)
+            logger.error(f"[{symbol}] ❌ Ошибка перп-ордера — откатываем спот-ногу")
+            self._unwind_spot_leg(symbol, pos)
             return
 
         pos.perp_order_id = perp_oid
@@ -516,11 +562,7 @@ class FundingRateBot:
         if not verified:
             logger.error(f"[{symbol}] ❌ Верификация не прошла — экстренное закрытие")
             self.client.close_position(symbol, "linear")
-            if pos.spot_qty > 0:
-                if direction in ("long_spot_short_perp", "basis_short_perp"):
-                    self.client.sell_spot(symbol, pos.spot_qty)
-                else:
-                    self.client.cover_short_spot(symbol, pos.spot_qty * spot_price)
+            self._unwind_spot_leg(symbol, pos)
             return
 
         # ── Позиция открыта ───────────────────────────────
@@ -542,6 +584,57 @@ class FundingRateBot:
             break_even_cycles=be_cycles,
         )
 
+    def _unwind_spot_leg(self, symbol: str, pos: HedgedPosition) -> float:
+        """
+        Полностью закрывает спот-ногу. Возвращает exit_spot_price (0.0 если не вышло).
+
+        LONG-спот: продаёт ФАКТИЧЕСКИЙ баланс монеты, а не теоретический pos.spot_qty.
+        Это и есть причина «крипта зависает на споте»: при покупке комиссия берётся
+        в base coin, поэтому реально на балансе чуть меньше, чем position_usd/price.
+        Попытка продать pos.spot_qty → Bybit отклоняет «insufficient balance» → крипта
+        остаётся. Продаём min(факт. баланс) с округлением вниз — всегда исполнимо.
+
+        SHORT-спот: выкупает заём (cover) с буфером +1%.
+        До 3 попыток; при полном провале — CRITICAL + алерт в Telegram (ручной разбор).
+        """
+        if pos.spot_qty <= 0:
+            return 0.0
+        is_long_spot = pos.direction in ("long_spot_short_perp", "basis_short_perp")
+
+        for attempt in range(1, 4):
+            try:
+                if is_long_spot:
+                    coin     = symbol.replace("USDT", "")
+                    spot_bal = self.client.get_spot_coin_balance(coin)
+                    qty      = self.client.round_qty(
+                        spot_bal if spot_bal > 0 else pos.spot_qty, symbol, "spot"
+                    )
+                    if qty <= 0:
+                        logger.warning(f"[{symbol}] спот-баланс {spot_bal} ≈ 0 — нечего продавать")
+                        return 0.0
+                    if self.client.sell_spot(symbol, qty):
+                        return self.client.get_last_price(symbol, "spot") or 0.0
+                else:
+                    price      = self.client.get_last_price(symbol, "spot") or pos.entry_spot_price
+                    cover_usdt = pos.spot_qty * price * 1.01   # +1% буфер на движение цены
+                    if self.client.cover_short_spot(symbol, cover_usdt):
+                        return self.client.get_last_price(symbol, "spot") or 0.0
+            except Exception as e:
+                logger.error(f"[{symbol}] unwind спота, попытка {attempt}/3: {e}")
+            time.sleep(1)
+
+        logger.critical(
+            f"[{symbol}] ❌❌ НЕ удалось закрыть спот-ногу за 3 попытки — РУЧНОЕ вмешательство!"
+        )
+        try:
+            self.tg.notify_error(
+                f"⚠️ {symbol}: не закрылась спот-нога ({pos.direction}), qty≈{pos.spot_qty}. "
+                f"Закрой вручную в Bybit!"
+            )
+        except Exception:
+            pass
+        return 0.0
+
     def _verify_position(self, symbol: str, pos: HedgedPosition) -> bool:
         """
         Верификация после открытия: проверяем что обе ноги реально открыты.
@@ -553,8 +646,12 @@ class FundingRateBot:
             logger.error(f"[{symbol}] Верификация: перп позиция не найдена!")
             return False
 
-        if perp_pos["side"] != "Sell":
-            logger.error(f"[{symbol}] Верификация: перп side={perp_pos['side']} (ожидался Sell)")
+        # Ожидаемая сторона перпа зависит от направления:
+        #   long_spot_short_perp / basis_short_perp → Sell (шорт перпа)
+        #   long_perp_short_spot / basis_long_perp  → Buy  (лонг перпа)
+        expected_side = "Sell" if pos.direction in ("long_spot_short_perp", "basis_short_perp") else "Buy"
+        if perp_pos["side"] != expected_side:
+            logger.error(f"[{symbol}] Верификация: перп side={perp_pos['side']} (ожидался {expected_side})")
             return False
 
         actual_qty = perp_pos["size"]
@@ -573,11 +670,13 @@ class FundingRateBot:
 
         logger.info(
             f"[{symbol}] Верификация ✅ | perp={actual_qty}@{pos.entry_perp_price:.4f} | "
-            f"side=Sell | unreal_pnl={perp_pos['unreal_pnl']:+.4f}"
+            f"side={expected_side} | unreal_pnl={perp_pos['unreal_pnl']:+.4f}"
         )
 
-        # Для спота верификация через баланс монеты
-        if config.HEDGE_WITH_SPOT:
+        # Для спота верификация через баланс монеты — только для LONG-спота
+        # (при шорте спота баланс монеты ≤ 0, проверка по балансу неприменима).
+        is_long_spot = pos.direction in ("long_spot_short_perp", "basis_short_perp")
+        if config.HEDGE_WITH_SPOT and is_long_spot:
             coin = symbol.replace("USDT", "")
             spot_bal = self.client.get_spot_coin_balance(coin)
             if spot_bal < pos.spot_qty * 0.9:
@@ -612,32 +711,8 @@ class FundingRateBot:
         if not perp_closed:
             logger.error(f"[{symbol}] Не удалось закрыть перп позицию")
 
-        # ── Закрываем спот ────────────────────────────────
-        exit_spot_price = 0.0
-        is_long_spot = pos.direction in ("long_spot_short_perp", "basis_short_perp")
-        is_short_spot = pos.direction in ("long_perp_short_spot", "basis_long_perp")
-
-        if pos.spot_qty > 0:
-            if is_long_spot:
-                # Продаём купленный спот
-                coin     = symbol.replace("USDT", "")
-                spot_bal = self.client.get_spot_coin_balance(coin)
-                qty      = min(pos.spot_qty, spot_bal) if spot_bal > 0 else pos.spot_qty
-                if qty > 0:
-                    sold = self.client.sell_spot(symbol, qty)
-                    if sold:
-                        exit_spot_price = self.client.get_last_price(symbol, "spot") or 0.0
-                    else:
-                        logger.error(f"[{symbol}] Не удалось продать спот ({qty})")
-
-            elif is_short_spot:
-                # Покрываем маржинальный шорт спота
-                cover_usdt = pos.spot_qty * (self.client.get_last_price(symbol, "spot") or pos.entry_spot_price)
-                covered = self.client.cover_short_spot(symbol, cover_usdt * 1.01)  # +1% буфер на движение цены
-                if covered:
-                    exit_spot_price = self.client.get_last_price(symbol, "spot") or 0.0
-                else:
-                    logger.error(f"[{symbol}] Не удалось покрыть шорт спота")
+        # ── Закрываем спот (надёжный unwind: факт. баланс + ретраи + алерт) ──
+        exit_spot_price = self._unwind_spot_leg(symbol, pos)
 
         time.sleep(1)
         bal_after = self.client.get_wallet_balance("USDT") or bal_before
