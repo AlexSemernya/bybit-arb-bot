@@ -718,19 +718,31 @@ class FundingRateBot:
         time.sleep(1)
         bal_after = self.client.get_wallet_balance("USDT") or bal_before
 
-        # ── Расчёт PnL ───────────────────────────────────
-        total_pnl  = bal_after - bal_before
-        spot_pnl   = 0.0
-        if config.HEDGE_WITH_SPOT and pos.entry_spot_price > 0 and exit_spot_price > 0:
-            spot_pnl = pos.spot_qty * (exit_spot_price - pos.entry_spot_price)
-
-        # Комиссия считается от реального notional позиции
-        commission = 4 * pos.notional_usd() * config.BYBIT_TAKER_FEE
-        hold_hours = pos.age_hours()
-
         exit_data       = self.last_funding_data.get(symbol, {})
         exit_rate       = exit_data.get("rate", 0.0)
-        exit_perp_price = exit_data.get("price", 0.0)
+        exit_perp_price = exit_data.get("price", 0.0) or pos.entry_perp_price
+
+        # ── PnL считаем ПО НОГАМ, а не по разнице USDT-баланса ────────────
+        # USDT-дельта врёт: средства, ушедшие в спот-холдинг, выглядят как
+        # убыток (это и был источник фейковых −79 USDT). Экономический PnL
+        # хеджа = spot_pnl + perp_pnl + собранный фандинг − комиссии.
+        # Ноги дельта-нейтральны → spot и perp почти гасят друг друга,
+        # в сухом остатке остаётся фандинг − комиссии.
+        commission = 4 * pos.notional_usd() * config.BYBIT_TAKER_FEE
+        long_spot  = pos.direction in ("long_spot_short_perp", "basis_short_perp")
+
+        spot_pnl = 0.0
+        if pos.entry_spot_price > 0 and exit_spot_price > 0 and pos.spot_qty > 0:
+            d = exit_spot_price - pos.entry_spot_price
+            spot_pnl = pos.spot_qty * (d if long_spot else -d)   # short-спот → знак инвертирован
+
+        perp_pnl = 0.0
+        if pos.entry_perp_price > 0 and exit_perp_price > 0 and pos.perp_qty > 0:
+            d = exit_perp_price - pos.entry_perp_price
+            perp_pnl = pos.perp_qty * (-d if long_spot else d)   # long_spot → перп SHORT
+
+        total_pnl  = spot_pnl + perp_pnl + pos.estimated_funding - commission
+        hold_hours = pos.age_hours()
 
         # ── Запись в историю ─────────────────────────────
         self.history.record(
