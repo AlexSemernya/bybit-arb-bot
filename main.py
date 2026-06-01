@@ -442,6 +442,28 @@ class FundingRateBot:
             logger.warning(f"[{symbol}] Заблокировано: {reason}")
             return
 
+        # ── Подтверждение базиса по ордербуку (анти-шум) ──────────────
+        # last-цены спота/перпа разъезжаются на тиках → ложный «базис» → вход
+        # на шуме и закрытие за 0.0ч в минус на комиссиях. Меряем базис по
+        # mid-ценам ордербука и требуем, чтобы он всё ещё был за порогом в ту
+        # же сторону. Нет данных ордербука — не входим.
+        if direction.startswith("basis_") and getattr(config, "BASIS_CONFIRM_WITH_ORDERBOOK", True):
+            ob_perp = self.client.get_orderbook(symbol, "linear")
+            ob_spot = self.client.get_orderbook(symbol, "spot")
+            if not ob_perp or not ob_spot or ob_spot.get("mid", 0) <= 0:
+                logger.warning(f"[{symbol}] basis: нет ордербука для подтверждения — пропуск")
+                return
+            mid_basis = ob_perp["mid"] / ob_spot["mid"] - 1.0
+            entry     = getattr(config, "BASIS_ENTRY_PCT", 0.005)
+            ok = (mid_basis >= entry) if direction == "basis_short_perp" else (mid_basis <= -entry)
+            if not ok:
+                logger.info(
+                    f"[{symbol}] basis по mid={mid_basis*100:.3f}% не подтверждён "
+                    f"(порог ±{entry*100:.3f}%) — шум, пропуск"
+                )
+                return
+            logger.info(f"[{symbol}] basis подтверждён по mid={mid_basis*100:+.3f}%")
+
         # ── Guard для шорт-спот направлений ──────────────
         # long_perp_short_spot / basis_long_perp занимают базовый токен и
         # платят за это почасовой borrow. Проверяем ДО входа, что:
