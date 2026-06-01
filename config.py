@@ -50,7 +50,7 @@ SYMBOLS = [
 
     # ── Solana-мемы (исторически самые высокие ставки) ───────────
     # Примечание: SHIB/PEPE/BONK/FLOKI торгуются с префиксом 1000 на Bybit
-    "DOGEUSDT",      "1000SHIBUSDT", "1000PEPEUSDT", "WIFUSDT",   "1000BONKUSDT",
+    "DOGEUSDT",      "1000PEPEUSDT", "WIFUSDT",   "1000BONKUSDT",
     "1000FLOKIUSDT", "POPCATUSDT",   "PNUTUSDT",     "FARTCOINUSDT",
 
     # ── Прочие с историей повышенных ставок ──────────────────────
@@ -124,7 +124,7 @@ MAX_POSITIONS_PER_CATEGORY = 2   # макс. позиций в одной кат
 
 SYMBOL_CATEGORIES = {
     "meme": [
-        "DOGEUSDT", "1000SHIBUSDT", "1000PEPEUSDT", "WIFUSDT", "1000BONKUSDT",
+        "DOGEUSDT", "1000PEPEUSDT", "WIFUSDT", "1000BONKUSDT",
         "1000FLOKIUSDT", "POPCATUSDT", "PNUTUSDT", "FARTCOINUSDT", "TRUMPUSDT",
     ],
     "ai": [
@@ -200,6 +200,9 @@ MIN_VOLUME_24H_USD       = 3_000_000   # $3M мин. 24ч оборот (было
 # ─────────────────────────────────────────────
 MAX_DRAWDOWN_PCT     = 0.20     # 20% максимальная просадка (было 10% — слишком чувствительно при spot purchases)
 BYBIT_TAKER_FEE      = 0.00055  # 0.055% taker fee
+# Брейкер «убытков подряд» считает только МАТЕРИАЛЬНЫЕ потери (≥ этой доли баланса).
+# Копеечные basis-минусы на комиссиях не должны глушить торговлю до рестарта.
+LOSS_STREAK_MIN_LOSS_PCT = 0.005   # 0.5% от entry-баланса
 
 # ─────────────────────────────────────────────
 #  НАСТРОЙКИ БОТА

@@ -70,15 +70,21 @@ class RiskManager:
         ret = pnl_usdt / entry_balance if entry_balance > 0 else 0.0
         self.state.trade_returns.append(ret)
 
-        if pnl_usdt >= 0:
-            self.state.consecutive_losses = 0
-            logger.info(f"Сделка: +{pnl_usdt:.4f} USDT ({ret*100:+.2f}%)")
-        else:
+        # Серия убытков считается только по МАТЕРИАЛЬНЫМ потерям. Мелкий минус на
+        # комиссиях (basis закрылся около нуля) — норма дельта-нейтрали, а не сигнал
+        # «что-то сломалось». Иначе брейкер глушит торговлю на fee-шуме до рестарта.
+        min_loss_pct  = getattr(self.cfg, "LOSS_STREAK_MIN_LOSS_PCT", 0.005)
+        material_loss = pnl_usdt < 0 and abs(ret) >= min_loss_pct
+
+        if material_loss:
             self.state.consecutive_losses += 1
             logger.warning(
-                f"Сделка: {pnl_usdt:.4f} USDT | "
+                f"Сделка: {pnl_usdt:+.4f} USDT ({ret*100:+.2f}%) | "
                 f"убытков подряд: {self.state.consecutive_losses}"
             )
+        else:
+            self.state.consecutive_losses = 0
+            logger.info(f"Сделка: {pnl_usdt:+.4f} USDT ({ret*100:+.2f}%)")
 
     def sharpe_ratio(self) -> float:
         r = self.state.trade_returns
