@@ -292,6 +292,9 @@ class FundingRateArbStrategy:
             else:
                 # perp дешевле спота → перп вырастет или спот упадёт
                 direction = "basis_long_perp"    # long perp + short spot
+                # Шорт спота выключен → не генерируем непроходные кандидаты
+                if not getattr(self.cfg, "ALLOW_SPOT_SHORT", False):
+                    continue
 
             candidates.append({
                 "symbol":    sym,
