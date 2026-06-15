@@ -397,6 +397,7 @@ class FundingRateBot:
             basis_candidates = self.strategy.scan_basis_opportunities(
                 funding_data=funding_data,
                 spot_prices=spot_prices,
+                volumes_24h=self.volumes_24h_cache,
                 active_symbols=already_picked,
                 max_slots=remaining,
             )
@@ -629,9 +630,13 @@ class FundingRateBot:
                 if is_long_spot:
                     coin     = symbol.replace("USDT", "")
                     spot_bal = self.client.get_spot_coin_balance(coin)
-                    qty      = self.client.round_qty(
-                        spot_bal if spot_bal > 0 else pos.spot_qty, symbol, "spot"
-                    )
+                    # Если баланс прочитан — продаём фактический (он уже net комиссии).
+                    # Если нет (API вернул пусто/0) — fallback с haircut 0.5%: спот-
+                    # комиссия удерживается в монете, поэтому реальный баланс всегда
+                    # чуть меньше pos.spot_qty. Продажа ровно pos.spot_qty → Insufficient
+                    # balance (ErrCode 170131) и спот-нога зависает непрохеджированной.
+                    raw_qty  = spot_bal if spot_bal > 0 else pos.spot_qty * 0.995
+                    qty      = self.client.round_qty(raw_qty, symbol, "spot")
                     if qty <= 0:
                         logger.warning(f"[{symbol}] спот-баланс {spot_bal} ≈ 0 — нечего продавать")
                         return 0.0

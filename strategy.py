@@ -251,6 +251,7 @@ class FundingRateArbStrategy:
         self,
         funding_data:   dict,   # {symbol: {"rate", "price", "next_time_ms"}}
         spot_prices:    dict,   # {symbol: spot_price}
+        volumes_24h:    dict,   # {symbol: turnover_24h_usd}
         active_symbols: set,
         max_slots:      int,
     ) -> list:
@@ -270,8 +271,16 @@ class FundingRateArbStrategy:
         min_vol   = getattr(self.cfg, "MIN_VOLUME_24H_USD", 3_000_000)
         candidates = []
 
+        block_neg = getattr(self.cfg, "BASIS_BLOCK_NEGATIVE_FUNDING", True)
+
         for sym, data in funding_data.items():
             if sym in active_symbols:
+                continue
+
+            # Фильтр объёма: на неликвиде «базис» — это широкий bid/ask спред, а не
+            # торгуемая аномалия. Вход туда = фантом → мгновенный basis_converged →
+            # чистый минус на комиссиях. Раньше min_vol читался, но не применялся.
+            if volumes_24h.get(sym, 0.0) < min_vol:
                 continue
 
             perp_price = data.get("price", 0.0)
@@ -289,6 +298,10 @@ class FundingRateArbStrategy:
             if basis > 0:
                 # perp дороже спота → перп упадёт или спот вырастет
                 direction = "basis_short_perp"   # short perp + long spot
+                # При отрицательном фандинге short-perp ПЛАТИТ фандинг — двойной
+                # минус поверх комиссий, пока держим позицию. Пропускаем.
+                if block_neg and data.get("rate", 0.0) < 0:
+                    continue
             else:
                 # perp дешевле спота → перп вырастет или спот упадёт
                 direction = "basis_long_perp"    # long perp + short spot

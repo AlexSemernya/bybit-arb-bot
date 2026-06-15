@@ -405,8 +405,14 @@ class BybitClient:
                 if c["coin"] == coin:
                     # walletBalance — фактическое кол-во токенов в аккаунте
                     # availableToWithdraw может быть 0 если токены используются как маржа
-                    wallet_bal = float(c.get("walletBalance", 0))
-                    avail_bal  = float(c.get("availableToWithdraw", 0))
+                    # Bybit для только что купленной монеты возвращает поле как ""
+                    # (пустая строка), а не отсутствующий ключ → float("") падает с
+                    # ValueError и баланс читался как 0 → unwind спот-ноги ломался
+                    # (Insufficient balance). Парсим "" / None как 0.0.
+                    def _f(v):
+                        return float(v) if v not in (None, "") else 0.0
+                    wallet_bal = _f(c.get("walletBalance"))
+                    avail_bal  = _f(c.get("availableToWithdraw"))
                     # Берём максимум: если walletBalance > 0, токены есть
                     return max(wallet_bal, avail_bal)
             return 0.0
